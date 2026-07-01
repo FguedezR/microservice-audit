@@ -1,0 +1,16 @@
+# Infra-as-code para Render. Al conectar el repo, Render lee este archivo.
+services:
+  - type: web
+    name: auditor-wp-hadock
+    runtime: python
+    plan: free                # cámbialo a "starter" para eliminar el cold start
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: API_SECRET
+        sync: false           # se define manualmente en el panel (no se versiona)
+      - key: CACHE_TTL
+        value: "3600"
+      - key: RATE_LIMIT_MAX
+        value: "20"
