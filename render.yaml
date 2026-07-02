@@ -1,16 +1,26 @@
-# Infra-as-code para Render. Al conectar el repo, Render lee este archivo.
+# render.yaml — Blueprint (Infrastructure as Code) del microservicio auditor.
+# Colócalo en la RAÍZ del repo. En Render: New > Blueprint > conecta el repo.
+# Docs: https://render.com/docs/blueprint-spec
 services:
   - type: web
-    name: auditor-wp-hadock
+    name: hadock-wp-auditor
     runtime: python
-    plan: free                # cámbialo a "starter" para eliminar el cold start
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    plan: free
+    region: frankfurt          # región free más cercana a España -> menor latencia
+    branch: main               # ajusta a tu rama de despliegue
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
+    autoDeploy: true           # deploy automático en cada push a `branch`
     envVars:
-      - key: API_SECRET
-        sync: false           # se define manualmente en el panel (no se versiona)
-      - key: CACHE_TTL
-        value: "3600"
-      - key: RATE_LIMIT_MAX
-        value: "20"
+      - key: PYTHON_VERSION
+        value: "3.12.4"        # fija el runtime; evita sorpresas si Render cambia el default
+      - key: AUDITOR_TOKEN
+        sync: false            # SECRETO: lo defines en el dashboard y lo compartes con WP.
+                               # No se versiona en el repo. Genera uno largo (32+ chars).
+      - key: MAX_WORKERS
+        value: "8"             # hilos por auditoría (concurrencia del escaneo)
+      - key: MAX_CONCURRENT_AUDITS
+        value: "2"             # auditorías simultáneas; sube con cuidado en free (RAM 512MB)
+      - key: VERIFY_SSL
+        value: "false"         # el auditor escanea sitios con certs potencialmente rotos

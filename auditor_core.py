@@ -21,7 +21,6 @@ import concurrent.futures
 import re
 
 import requests
-import urllib3
 
 from checks_data import (
     ENDPOINTS_MAESTROS,
@@ -29,8 +28,6 @@ from checks_data import (
     MAPEO_CATEGORIAS,
     CATEGORIA_POR_DEFECTO,
 )
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _UA = {
     "User-Agent": (
