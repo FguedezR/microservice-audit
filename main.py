@@ -41,7 +41,13 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
+
+# El auditor escanea sitios de terceros que pueden tener certificados rotos.
+# Desactivamos la verificación TLS de forma CONSCIENTE (ver `verificar_ssl` abajo)
+# y silenciamos el ruido de warnings para no contaminar los logs.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger("auditor_wp")
 
@@ -52,16 +58,31 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Concurrencia deliberadamente BAJA: 20 hilos golpeando un único host parece un
-# mini-DoS y dispara rate-limiting (429) que falsearía el análisis. 8 es el punto
-# de equilibrio velocidad/fiabilidad. Ajustable por objetivo si hace falta.
-MAX_WORKERS_DEFECTO = 8
+# Concurrencia deliberadamente BAJA: golpear un único host con demasiados hilos
+# paralelos dispara WAFs (Wordfence, Sucuri, Cloudflare) devolviendo 429 en masa,
+# lo que convierte la mayoría de checks en "Inconcluso".
+# 4 hilos + throttle inter-petición mantienen la ráfaga por debajo del umbral
+# típico de Wordfence (~20 req / 10s) mientras siguen dando un speedup de ~3-4x
+# frente a secuencial. Ajustable por objetivo si hace falta.
+MAX_WORKERS_DEFECTO = 4
 
 # Timeouts por fase (segundos). Cortos a propósito: una ruta que cuelga no debe
 # arrastrar toda la auditoría.
 TIMEOUT_ENDPOINT = 4
 TIMEOUT_GENERAL = 6
 TIMEOUT_ROBOTS = 5
+
+# Retry + backoff exponencial para respuestas 429 / 503. Cuando el WAF rate-limitea
+# una petición, esperamos y reintentamos en vez de marcar "Inconcluso" directamente.
+# 3 reintentos con backoff 2s -> 4s -> 8s = 14s máx por petición (aceptable en un
+# escaneo de ~30s; y solo aplica a las que el WAF corte, no a todas).
+RETRY_MAX = 3
+RETRY_BACKOFF_BASE = 2.0  # segundos; cada intento espera base * 2^intento
+
+# Pausa inter-petición por hilo (segundos). Espacia las ráfagas dentro de cada
+# worker para no saturar la ventana del rate-limiter. 0.3s × 4 hilos = ~13 req/s
+# máximo, por debajo del umbral de la mayoría de WAFs.
+THROTTLE_INTER_REQUEST = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +336,7 @@ def validar_objetivo_publico(dominio: str) -> None:
         raise ObjetivoInvalido(f"No se pudo resolver el dominio: {host}") from exc
     for info in infos:
         ip = info[4][0]
-        if not _es_ip_publica(str(ip)):
+        if not _es_ip_publica(ip):
             raise ObjetivoInvalido(
                 f"El objetivo '{host}' resuelve a una IP no pública ({ip}); "
                 "bloqueado por seguridad (SSRF)."
@@ -364,6 +385,54 @@ def _leer_parcial(res: requests.Response) -> tuple[str, bool, int]:
             es_gigante = True
             break
     return bytes_leidos.decode("utf-8", errors="ignore"), es_gigante, content_length
+
+
+def _get_con_retry(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """
+    GET con retry + backoff exponencial para 429/503 y throttle inter-petición.
+
+    Lógica: si el WAF rate-limitea (429) o el servidor está temporalmente saturado
+    (503), esperamos y reintentamos en vez de rendirse. Si el header Retry-After
+    viene en la respuesta, lo respetamos (capeado a 15s para no colgar el audit).
+    Tras agotar reintentos, devolvemos la última respuesta 429/503 tal cual para
+    que el caller la marque como "Inconcluso".
+
+    El throttle (THROTTLE_INTER_REQUEST) se aplica ANTES de cada petición (incluida
+    la primera) para espaciar las ráfagas entre los N hilos del pool. Es una pausa
+    corta (~0.3s) que baja la tasa global de ~30 req/s a ~13 req/s, por debajo del
+    umbral de Wordfence.
+    """
+    ultimo_response: requests.Response | None = None
+    for intento in range(1 + RETRY_MAX):  # 1 intento original + RETRY_MAX reintentos
+        time.sleep(THROTTLE_INTER_REQUEST)  # throttle inter-petición
+
+        try:
+            resp = session.get(url, **kwargs)
+        except requests.RequestException:
+            if intento < RETRY_MAX:
+                time.sleep(RETRY_BACKOFF_BASE * (2 ** intento))
+                continue
+            raise  # último intento: dejamos que suba la excepción
+
+        if resp.status_code not in (429, 503):
+            return resp  # respuesta limpia -> salimos
+
+        # WAF/rate-limit: guardar y esperar antes de reintentar
+        ultimo_response = resp
+        if intento < RETRY_MAX:
+            # Respetar Retry-After si viene, capeado a 15s
+            espera = RETRY_BACKOFF_BASE * (2 ** intento)
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    espera = min(float(retry_after), 15.0)
+                except ValueError:
+                    pass
+            logger.debug("429/503 en %s | intento %d/%d | esperando %.1fs",
+                         url, intento + 1, RETRY_MAX, espera)
+            time.sleep(espera)
+
+    return ultimo_response  # agotados los reintentos: devolvemos el 429/503
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +578,7 @@ def check_plugin_dir(session: requests.Session, target: str, slug: str) -> dict[
           "imp": "Riesgo alto de ingeniería inversa y descubrimiento de archivos sensibles o archivos vulnerables no protegidos dentro del plugin."}
     url = f"{target}/wp-content/plugins/{slug}/"
     try:
-        r = session.get(url, timeout=TIMEOUT_ROBOTS, allow_redirects=False)
+        r = _get_con_retry(session, url, timeout=TIMEOUT_ROBOTS, allow_redirects=False)
         if r.status_code in (429, 503):
             return _item(ep, "Inconcluso", "El servidor limitó la petición (rate-limit); no se pudo comprobar.", url)
         if r.status_code == 200 and "index of" in r.text.lower():
@@ -525,8 +594,8 @@ def check_endpoint(session: requests.Session, target: str, ep: dict[str, Any],
     url = f"{target}{ep['path']}"
     evitar_redir = ep["tipo"] in ("admin", "author")
     try:
-        res = session.get(url, timeout=TIMEOUT_ENDPOINT,
-                          allow_redirects=not evitar_redir, stream=True)
+        res = _get_con_retry(session, url, timeout=TIMEOUT_ENDPOINT,
+                             allow_redirects=not evitar_redir, stream=True)
 
         # Rate-limit / servicio no disponible -> no podemos afirmar nada (correctness).
         if res.status_code in (429, 503):
