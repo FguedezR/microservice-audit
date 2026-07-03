@@ -760,6 +760,48 @@ def _ordenar_categoria(items: list[dict[str, Any]], orden: list[str]) -> list[di
     return sorted(items, key=prioridad)
 
 
+# Nº de hallazgos destacados para el informe PDF (lead magnet). Fijo a propósito:
+# Google Docs (vía Make) solo soporta marcadores fijos, no listas de longitud
+# variable, así que el motor aplana el resultado a exactamente N campos
+# numerados en vez de devolver un array de tamaño variable.
+TOP_HALLAZGOS_N = 8
+
+
+def seleccionar_top_hallazgos(resultados: list[dict[str, Any]],
+                              n: int = TOP_HALLAZGOS_N) -> list[dict[str, Any]]:
+    """
+    Selecciona los N hallazgos "Error" más graves para el resumen ejecutivo.
+
+    Orden: primero por puntos (gravedad numérica: Crítica=10 > Alta=7 > Media=4
+    > Baja=2), y a igualdad de puntos, se mantiene el orden de detección para
+    que el resultado sea determinista entre ejecuciones idénticas.
+    """
+    errores = [it for it in resultados if it["estado"] == "Error"]
+    errores_ordenados = sorted(errores, key=lambda it: it["puntos"], reverse=True)
+    return errores_ordenados[:n]
+
+
+def _hallazgos_aplanados(top_hallazgos: list[dict[str, Any]], n: int = TOP_HALLAZGOS_N) -> dict[str, str]:
+    """
+    Convierte la lista de top hallazgos en N*3 campos planos con nombres fijos
+    (hallazgo_1_nombre, hallazgo_1_gravedad, hallazgo_1_impacto, hallazgo_2_...),
+    listos para mapear uno a uno como marcadores de una plantilla de Google Docs.
+    Si hay menos de N hallazgos reales, los campos sobrantes quedan como "".
+    """
+    campos: dict[str, str] = {}
+    for i in range(1, n + 1):
+        if i <= len(top_hallazgos):
+            h = top_hallazgos[i - 1]
+            campos[f"hallazgo_{i}_nombre"] = h["nombre"]
+            campos[f"hallazgo_{i}_gravedad"] = h["gravedad"]
+            campos[f"hallazgo_{i}_impacto"] = h["imp"]
+        else:
+            campos[f"hallazgo_{i}_nombre"] = ""
+            campos[f"hallazgo_{i}_gravedad"] = ""
+            campos[f"hallazgo_{i}_impacto"] = ""
+    return campos
+
+
 def construir_resultado(dominio: str, resultados: list[dict[str, Any]],
                         duracion: float) -> dict[str, Any]:
     """Ensambla el diccionario final JSON-serializable (para API / PDF / frontend)."""
@@ -785,7 +827,9 @@ def construir_resultado(dominio: str, resultados: list[dict[str, Any]],
         })
 
     evaluables = [it for it in resultados if it["estado"] in ("Error", "Correcto")]
-    return {
+    top_hallazgos = seleccionar_top_hallazgos(resultados)
+
+    resultado = {
         "dominio": dominio,
         "generado_en": datetime.now(timezone.utc).isoformat(),
         "duracion_segundos": round(duracion, 2),
@@ -802,7 +846,11 @@ def construir_resultado(dominio: str, resultados: list[dict[str, Any]],
             "puntos_maximos": sum(it["puntos"] for it in evaluables),
         },
         "categorias": categorias_payload,
+        # --- Campos para el informe PDF (lead magnet, resumen ejecutivo) ---
+        "num_hallazgos_reales": len(top_hallazgos),  # útil para mensajes tipo "Encontramos N problemas"
     }
+    resultado.update(_hallazgos_aplanados(top_hallazgos))  # hallazgo_1_nombre, hallazgo_1_gravedad, ...
+    return resultado
 
 
 # ---------------------------------------------------------------------------
