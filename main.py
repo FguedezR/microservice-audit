@@ -61,10 +61,10 @@ USER_AGENT = (
 # Concurrencia deliberadamente BAJA: golpear un único host con demasiados hilos
 # paralelos dispara WAFs (Wordfence, Sucuri, Cloudflare) devolviendo 429 en masa,
 # lo que convierte la mayoría de checks en "Inconcluso".
-# 4 hilos + throttle inter-petición mantienen la ráfaga por debajo del umbral
-# típico de Wordfence (~20 req / 10s) mientras siguen dando un speedup de ~3-4x
-# frente a secuencial. Ajustable por objetivo si hace falta.
-MAX_WORKERS_DEFECTO = 4
+# 3 hilos + throttle inter-petición mantienen la ráfaga por debajo del umbral
+# típico de Wordfence. Se bajó de 4 a 3 tras observar en producción (hadock.es)
+# que 4 hilos + 0.3s de throttle seguían disparando rate-limit de forma masiva.
+MAX_WORKERS_DEFECTO = 3
 
 # Timeouts por fase (segundos). Cortos a propósito: una ruta que cuelga no debe
 # arrastrar toda la auditoría.
@@ -72,17 +72,30 @@ TIMEOUT_ENDPOINT = 4
 TIMEOUT_GENERAL = 6
 TIMEOUT_ROBOTS = 5
 
-# Retry + backoff exponencial para respuestas 429 / 503. Cuando el WAF rate-limitea
-# una petición, esperamos y reintentamos en vez de marcar "Inconcluso" directamente.
-# 3 reintentos con backoff 2s -> 4s -> 8s = 14s máx por petición (aceptable en un
-# escaneo de ~30s; y solo aplica a las que el WAF corte, no a todas).
-RETRY_MAX = 3
-RETRY_BACKOFF_BASE = 2.0  # segundos; cada intento espera base * 2^intento
+# Retry + backoff para 429/503. IMPORTANTE: el coste máximo por petición está
+# acotado a propósito (RETRY_MAX bajo + cap de espera corto) porque el módulo
+# HTTP de Make tiene un techo duro de 300s por llamada. Si el WAF rate-limita
+# muchos endpoints a la vez, un backoff generoso multiplicado por 70+ endpoints
+# revienta ese presupuesto aunque cada reintento individual sea razonable.
+# 2 reintentos con backoff 1.5s -> 3s = 4.5s máx de espera propia por petición,
+# más lo que indique Retry-After (capado a 8s en vez de 15s).
+RETRY_MAX = 2
+RETRY_BACKOFF_BASE = 1.5  # segundos; cada intento espera base * 2^intento
 
 # Pausa inter-petición por hilo (segundos). Espacia las ráfagas dentro de cada
-# worker para no saturar la ventana del rate-limiter. 0.3s × 4 hilos = ~13 req/s
-# máximo, por debajo del umbral de la mayoría de WAFs.
-THROTTLE_INTER_REQUEST = 0.3
+# worker para no saturar la ventana del rate-limiter. 0.5s × 3 hilos = ~6 req/s
+# máximo -- más conservador que la versión anterior (13 req/s), que en
+# producción no fue suficiente para evitar el rate-limit de Wordfence.
+THROTTLE_INTER_REQUEST = 0.5
+
+# Techo de tiempo (segundos) para la fase paralela de checks. Circuit-breaker
+# global: si se supera, se deja de reintentar y lo pendiente se marca "Inconcluso".
+# 180s deja margen bajo el timeout máximo configurable en Make (300s) y bajo el
+# que configramos en el módulo HTTP (250s), incluso sumando el cold start de
+# Render (30-60s) que ocurre ANTES de que empiece a correr este código.
+AUDIT_TIME_BUDGET_SECONDS = 180.0
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -387,52 +400,74 @@ def _leer_parcial(res: requests.Response) -> tuple[str, bool, int]:
     return bytes_leidos.decode("utf-8", errors="ignore"), es_gigante, content_length
 
 
-def _get_con_retry(session: requests.Session, url: str, **kwargs) -> requests.Response:
+def _get_con_retry(session: requests.Session, url: str, *,
+                   deadline: float | None = None, **kwargs) -> requests.Response:
     """
     GET con retry + backoff exponencial para 429/503 y throttle inter-petición.
 
     Lógica: si el WAF rate-limitea (429) o el servidor está temporalmente saturado
     (503), esperamos y reintentamos en vez de rendirse. Si el header Retry-After
-    viene en la respuesta, lo respetamos (capeado a 15s para no colgar el audit).
+    viene en la respuesta, lo respetamos (capeado a 8s para no colgar el audit
+    completo si muchos endpoints están rate-limitados a la vez).
     Tras agotar reintentos, devolvemos la última respuesta 429/503 tal cual para
     que el caller la marque como "Inconcluso".
 
     El throttle (THROTTLE_INTER_REQUEST) se aplica ANTES de cada petición (incluida
-    la primera) para espaciar las ráfagas entre los N hilos del pool. Es una pausa
-    corta (~0.3s) que baja la tasa global de ~30 req/s a ~13 req/s, por debajo del
-    umbral de Wordfence.
+    la primera) para espaciar las ráfagas entre los N hilos del pool.
+
+    `deadline` (timestamp de time.perf_counter()) es un circuit-breaker global:
+    si ya lo hemos superado, no reintentamos más -- devolvemos lo que tengamos
+    (o dejamos que la excepción/respuesta 429 suba tal cual). Sin esto, un WAF
+    que rate-limite el 100% de las peticiones (no solo picos) podría hacer que
+    la suma de reintentos de 80+ endpoints reviente el timeout del módulo HTTP
+    de Make (visto en producción: 250s superados con el WAF muy agresivo).
     """
     ultimo_response: requests.Response | None = None
     for intento in range(1 + RETRY_MAX):  # 1 intento original + RETRY_MAX reintentos
+        # Circuit-breaker ANTES de gastar el throttle + la petición del siguiente
+        # intento. Sin este corte temprano, saltarse solo el sleep() de backoff no
+        # basta: el bucle seguiría haciendo throttle + petición real en cada vuelta.
+        if deadline is not None and time.perf_counter() >= deadline and intento > 0:
+            break
+
         time.sleep(THROTTLE_INTER_REQUEST)  # throttle inter-petición
 
         try:
             resp = session.get(url, **kwargs)
         except requests.RequestException:
-            if intento < RETRY_MAX:
+            agotado_por_deadline = deadline is not None and time.perf_counter() >= deadline
+            if intento < RETRY_MAX and not agotado_por_deadline:
                 time.sleep(RETRY_BACKOFF_BASE * (2 ** intento))
                 continue
-            raise  # último intento: dejamos que suba la excepción
+            raise  # último intento (o deadline superado): dejamos que suba la excepción
 
         if resp.status_code not in (429, 503):
             return resp  # respuesta limpia -> salimos
 
         # WAF/rate-limit: guardar y esperar antes de reintentar
         ultimo_response = resp
+        agotado_por_deadline = deadline is not None and time.perf_counter() >= deadline
+        if agotado_por_deadline:
+            logger.debug("Deadline global superado, se abandona el retry de %s", url)
+            break  # corte inmediato: no más throttle ni peticiones para esta URL
         if intento < RETRY_MAX:
-            # Respetar Retry-After si viene, capeado a 15s
+            # Respetar Retry-After si viene, capeado a 8s (ver docstring: presupuesto
+            # total acotado para no reventar el timeout del módulo HTTP de Make)
             espera = RETRY_BACKOFF_BASE * (2 ** intento)
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
                 try:
-                    espera = min(float(retry_after), 15.0)
+                    espera = min(float(retry_after), 8.0)
                 except ValueError:
                     pass
+            # No dormir más de lo que queda de presupuesto global.
+            if deadline is not None:
+                espera = max(0.0, min(espera, deadline - time.perf_counter()))
             logger.debug("429/503 en %s | intento %d/%d | esperando %.1fs",
                          url, intento + 1, RETRY_MAX, espera)
             time.sleep(espera)
 
-    return ultimo_response  # agotados los reintentos: devolvemos el 429/503
+    return ultimo_response  # agotados los reintentos (o deadline): devolvemos el 429/503
 
 
 # ---------------------------------------------------------------------------
@@ -573,12 +608,13 @@ def check_robots(session: requests.Session, target: str) -> list[dict[str, Any]]
         return [_item(ep, "Error", "Error al conectar o localizar el archivo robots.txt.", url)]
 
 
-def check_plugin_dir(session: requests.Session, target: str, slug: str) -> dict[str, Any]:
+def check_plugin_dir(session: requests.Session, target: str, slug: str,
+                     deadline: float | None = None) -> dict[str, Any]:
     ep = {"nombre": f"Listado de directorio abierto en plugin: {slug}", "gravedad": "Alta", "puntos": 7,
           "imp": "Riesgo alto de ingeniería inversa y descubrimiento de archivos sensibles o archivos vulnerables no protegidos dentro del plugin."}
     url = f"{target}/wp-content/plugins/{slug}/"
     try:
-        r = _get_con_retry(session, url, timeout=TIMEOUT_ROBOTS, allow_redirects=False)
+        r = _get_con_retry(session, url, timeout=TIMEOUT_ROBOTS, allow_redirects=False, deadline=deadline)
         if r.status_code in (429, 503):
             return _item(ep, "Inconcluso", "El servidor limitó la petición (rate-limit); no se pudo comprobar.", url)
         if r.status_code == 200 and "index of" in r.text.lower():
@@ -589,13 +625,14 @@ def check_plugin_dir(session: requests.Session, target: str, slug: str) -> dict[
 
 
 def check_endpoint(session: requests.Session, target: str, ep: dict[str, Any],
-                   baseline_status: int, baseline_len: int) -> dict[str, Any]:
+                   baseline_status: int, baseline_len: int,
+                   deadline: float | None = None) -> dict[str, Any]:
     """Comprueba un endpoint del catálogo aplicando la detección según su `tipo`."""
     url = f"{target}{ep['path']}"
     evitar_redir = ep["tipo"] in ("admin", "author")
     try:
         res = _get_con_retry(session, url, timeout=TIMEOUT_ENDPOINT,
-                             allow_redirects=not evitar_redir, stream=True)
+                             allow_redirects=not evitar_redir, stream=True, deadline=deadline)
 
         # Rate-limit / servicio no disponible -> no podemos afirmar nada (correctness).
         if res.status_code in (429, 503):
@@ -772,12 +809,19 @@ def construir_resultado(dominio: str, resultados: list[dict[str, Any]],
 # Punto de entrada principal
 # ---------------------------------------------------------------------------
 def run_audit(dominio_input: str, *, max_workers: int = MAX_WORKERS_DEFECTO,
-              verificar_ssl: bool = False) -> dict[str, Any]:
+              verificar_ssl: bool = False,
+              time_budget_seconds: float = AUDIT_TIME_BUDGET_SECONDS) -> dict[str, Any]:
     """
     Ejecuta la auditoría completa y devuelve un dict JSON-serializable.
 
     Lanza ObjetivoInvalido si el dominio apunta a red interna (SSRF) o no resuelve,
     y AuditoriaError si el host está caído.
+
+    `time_budget_seconds` es el techo de tiempo total (circuit-breaker) para la fase
+    de checks en paralelo: si el WAF del objetivo rate-limita masivamente (no solo en
+    picos), los endpoints que aún no se han completado dejan de reintentar y se
+    marcan "Inconcluso" en vez de arrastrar la auditoría por encima del timeout del
+    llamador (ej. el módulo HTTP de Make, con un techo duro de 300s).
     """
     inicio = time.perf_counter()
     dominio = limpiar_dominio(dominio_input)
@@ -797,6 +841,10 @@ def run_audit(dominio_input: str, *, max_workers: int = MAX_WORKERS_DEFECTO,
         logger.info("Auditando %s | plugins detectados: %d | baseline: %s/%d bytes",
                     dominio, len(slugs), baseline_status, baseline_len)
 
+        # Deadline global para la fase paralela, calculado a partir de AQUÍ (después
+        # de la fase secuencial, que también consume tiempo del presupuesto total).
+        deadline = time.perf_counter() + time_budget_seconds
+
         # --- Fase paralela: todo lo independiente en un solo pool ---
         # Cada tarea es un callable sin argumentos que devuelve un item o lista de items.
         tareas: list[Callable[[], Any]] = [
@@ -804,8 +852,8 @@ def run_audit(dominio_input: str, *, max_workers: int = MAX_WORKERS_DEFECTO,
             lambda: check_cabeceras_y_fuente(session, target_https),
             lambda: check_robots(session, target_https),
         ]
-        tareas += [lambda s=s: check_plugin_dir(session, target_https, s) for s in slugs]
-        tareas += [lambda e=ep: check_endpoint(session, target_https, e, baseline_status, baseline_len)
+        tareas += [lambda s=s: check_plugin_dir(session, target_https, s, deadline=deadline) for s in slugs]
+        tareas += [lambda e=ep: check_endpoint(session, target_https, e, baseline_status, baseline_len, deadline=deadline)
                    for ep in ENDPOINTS_MAESTROS]
 
         resultados: list[dict[str, Any]] = []
